@@ -1,10 +1,7 @@
-const AnyDense = Union{Dense, LoRADense}
-
-
-struct FeedForward{W<:AnyDense}
-    w1::W
-    w2::W
-    w3::W
+@concrete struct FeedForward
+    w1
+    w2
+    w3
 end
 
 Flux.@layer FeedForward
@@ -20,24 +17,24 @@ end
 (ff::FeedForward)(x) = ff.w2(Flux.swish(ff.w1(x)) .* ff.w3(x))
 
 
-struct RMSNorm{T<:AbstractFloat,W<:AbstractVector{T}}
-    weight::W
-    eps::T
+@concrete struct RMSNorm
+    weight
+    eps
 end
 
 Flux.@layer RMSNorm
 
-RMSNorm(dim::Int; eps::T=1f-5) where T = RMSNorm(ones(T, dim), eps)
+RMSNorm(dim::Int; eps=1f-5) = RMSNorm(ones(typeof(eps), dim), eps)
 
 function (norm::RMSNorm)(x)
-    rms = sqrt.(sum(abs2, x, dims=1) / size(x, 1) .+ norm.eps)
+    rms = sqrt.(sum(abs2, x, dims=1) ./ size(x, 1) .+ norm.eps)
     return x .* (norm.weight ./ rms)
 end
 
 
-struct RoPE{A<:AbstractArray}
-    cos::A
-    sin::A
+@concrete struct RoPE
+    cos
+    sin
 end
 
 Flux.@layer RoPE trainable=()
@@ -82,9 +79,10 @@ end
 # https://discuss.huggingface.co/t/is-llama-rotary-embedding-implementation-correct/44509
 # Use this one if you're using the Hugging Face weights.
 function (rope::RoPE)(x)
-    head_dim = size(x, 1)
-    x1 = x[1:head_dim÷2, :, :, :]
-    x2 = x[head_dim÷2+1:end, :, :, :]
+    n = size(x, 1)
+    k = n ÷ 2
+    x1 = selectdim(x, 1, 1:k)
+    x2 = selectdim(x, 1, 1+k:n)
     return vcat(  
         x1 .* rope.cos .- x2 .* rope.sin,
         x2 .* rope.cos .+ x1 .* rope.sin
@@ -92,127 +90,84 @@ function (rope::RoPE)(x)
 end
 
 function unrope(rope, x)
-    head_dim = size(x, 1)
-    x1 = x[1:head_dim÷2, :, :, :]
-    x2 = x[head_dim÷2+1:end, :, :, :]
+    n = size(x, 1)
+    k = n ÷ 2
+    x1 = selectdim(x, 1, 1:k)
+    x2 = selectdim(x, 1, 1+k:n)
     return vcat(  
         x1 .* rope.cos .+ x2 .* rope.sin,
         x2 .* rope.cos .- x1 .* rope.sin
     )
 end
 
-#Scaled dot product attention
-function sdpa(xq::AbstractArray{T}, xk::AbstractArray{T}, xv::AbstractArray{T}, mask::AbstractArray{T}, head_dim::Int) where T
-    A = softmax(batched_mul(batched_transpose(xk), xq) / sqrt(T(head_dim)) .+ mask; dims=1)
-    return batched_mul(xv, A)
+@concrete struct Attention
+    wq
+    wk
+    wv
+    wo
+    heads::Int
+    kv_repeat::Int
 end
 
-mutable struct Attention
-    wq::AnyDense
-    wk::AnyDense
-    wv::AnyDense
-    wo::AnyDense
-    dim::Int
-    n_heads::Int
-    n_kv_heads::Int
-    head_dim::Int
-    cache::KVCache
+Flux.@layer Attention
+
+function Attention(embed_dim, heads, kv_heads=heads; qkv_bias=false)
+    head_dim = embed_dim ÷ heads
+    return Attention(
+        Dense(embed_dim => heads * head_dim, bias=qkv_bias),
+        Dense(embed_dim => kv_heads * head_dim, bias=qkv_bias),
+        Dense(embed_dim => kv_heads * head_dim, bias=qkv_bias),
+        Dense(heads * head_dim => embed_dim, bias=false),
+        heads, heads ÷ kv_heads)
 end
 
-Flux.@layer Attention trainable=(wq,wv)
-
-function Attention(dim::Int, n_heads::Int, n_kv_heads=n_heads; qkv_bias=false)
-    head_dim = dim ÷ n_heads
-    Attention(
-        Dense(dim => n_heads * head_dim, bias=qkv_bias),
-        Dense(dim => n_kv_heads * head_dim, bias=qkv_bias),
-        Dense(dim => n_kv_heads * head_dim, bias=qkv_bias),
-        Dense(n_heads * head_dim => dim, bias=false),
-        dim,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        KVCache(Float32; n_kv_heads, head_dim)
-    )
+function (layer::Attention)(xq, xk=xq; rope=identity, cache=tuple, dpa=dpa, mask=nothing)
+    q, k, v = layer.wq(xq), layer.wk(xk), layer.wv(xk)
+    q, k, v = rearrange.((q, k, v), einops"(dim heads) ... -> dim heads ..."; layer.heads)
+    q, k = rope(q), rope(k)
+    k, v = cache(k, v)
+    k, v = repeat.((k, v), einops"dim len heads ... -> dim len (kv_repeat heads) ..."; layer.kv_repeat)
+    x = dpa(q, k, v; mask)
+    x = rearrange(x, einops"dim heads ... -> (dim heads) ...")
+    return layer.wo(x)
 end
 
-repeat_kv(x::AbstractArray, n_rep::Int) = isone(n_rep) ? x : repeat(x, 1, n_rep, 1, 1)
-
-function (attn::Attention)(x::AbstractArray{T}, start_pos::Integer, rope=nothing, mask=false, sdpa_func = sdpa) where T
-    _, seqlen, batch = size(x)
-
-    xq = attn.wq(x)
-    xk = attn.wk(x)
-    xv = attn.wv(x)
-
-    xq = reshape(xq, (attn.head_dim, attn.n_heads, seqlen, batch))
-    xk = reshape(xk, (attn.head_dim, attn.n_kv_heads, seqlen, batch))
-    xv = reshape(xv, (attn.head_dim, attn.n_kv_heads, seqlen, batch))
-
-    xq = permutedims(xq, (1,3,2,4))
-    xk = permutedims(xk, (1,3,2,4))
-    xv = permutedims(xv, (1,3,2,4))
-
-    if rope isa RoPE
-        xq, xk = rope(xq), rope(xk)
-    end
-
-    # Update if cache is configured with seq_length > 0
-    xk, xv = update!(attn.cache, start_pos, xk, xv)
-
-    xk = repeat_kv(xk, attn.n_heads ÷ attn.n_kv_heads)
-    xv = repeat_kv(xv, attn.n_heads ÷ attn.n_kv_heads)
-
-    xq_for_attn = reshape(xq, attn.head_dim, :, attn.n_heads * batch)
-    xk_for_attn = reshape(xk, attn.head_dim, :, attn.n_heads * batch)
-    xv_for_attn = reshape(xv, attn.head_dim, :, attn.n_heads * batch)
-
-    output = sdpa_func(xq_for_attn, xk_for_attn, xv_for_attn, mask, attn.head_dim)
-    
-    e_output = reshape(output, (attn.head_dim, seqlen, attn.n_heads, batch))
-    p_output = permutedims(e_output, (1,3,2,4)) 
-    r_output = reshape(p_output, (attn.n_heads * attn.head_dim, seqlen, batch))
-    proj = attn.wo(r_output)
-    return proj
+@concrete struct TransformerBlock
+    attention
+    feed_forward
+    attention_norm
+    ffn_norm
 end
 
-struct TransformerBlock{A<:Attention,F<:FeedForward,AN<:RMSNorm,FN<:RMSNorm}
-    attention::A
-    feed_forward::F
-    attention_norm::AN
-    ffn_norm::FN
-end
+Flux.@layer TransformerBlock
 
 function TransformerBlock(
-    dim::Int, n_heads::Int, n_kv_heads::Int = n_heads, ff_hidden_dim = 4 * dim;
+    embed_dim, heads, kv_heads=heads, ff_hidden_dim=4*embed_dim;
     norm_eps=1f-5, qkv_bias=false
 )
     TransformerBlock(
-        Attention(dim, n_heads, n_kv_heads; qkv_bias),
-        FeedForward(dim, ff_hidden_dim),
-        RMSNorm(dim, eps=norm_eps),
-        RMSNorm(dim, eps=norm_eps)
+        Attention(embed_dim, heads, kv_heads; qkv_bias),
+        FeedForward(embed_dim, ff_hidden_dim),
+        RMSNorm(embed_dim, eps=norm_eps),
+        RMSNorm(embed_dim, eps=norm_eps)
     )
 end
 
-function (block::TransformerBlock)(x, start_pos, rope, mask, sdpa)
-    h = x + block.attention(block.attention_norm(x), start_pos, rope, mask, sdpa)
+function (block::TransformerBlock)(x; kwargs...)
+    h = x + block.attention(block.attention_norm(x); kwargs...)
     out = h + block.feed_forward(block.ffn_norm(h))
     return out
 end
 
-Flux.@layer TransformerBlock trainable=(attention,)
-
-mutable struct Transformer{E<:Flux.Embedding,B<:Tuple{Vararg{TransformerBlock}},N<:RMSNorm,O<:Dense,R<:RoPE}
-    tok_embeddings::E
-    layers::B
-    norm::N
-    output::O
-    rope::R
-    pos::Int
+@concrete struct Transformer
+    tok_embeddings
+    layers
+    norm
+    output
+    rope
 end
 
-Flux.@layer Transformer trainable=(layers,)
+Flux.@layer Transformer
 
 function Transformer(
     vocab_size::Int, dim::Int, n_layers::Int, n_heads::Int, 
@@ -223,7 +178,7 @@ function Transformer(
     use_scaled_rope=false,
     scale_factor=8
 ) where T
-    tok_embeddings = Flux.Embedding(vocab_size => dim)
+    tok_embeddings = Embedding(vocab_size => dim)
     layers = Tuple(TransformerBlock(dim, n_heads, n_kv_heads, ff_hidden_dim; norm_eps=norm_eps, qkv_bias=qkv_bias) for _ in 1:n_layers)
     norm = RMSNorm(dim, eps=norm_eps)
     output = Dense(dim => vocab_size, bias=false)

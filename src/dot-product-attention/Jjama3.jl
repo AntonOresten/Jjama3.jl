@@ -1,6 +1,14 @@
-#Trying out some tricks for attention.
+# Scaled dot product attention
+# takes d x h x l x b
+function dpa(q::AbstractArray{T}, k::AbstractArray{T}, v::AbstractArray{T}; mask) where T
+    d, h = size(q)
+    q, k, v = rearrange.((q, k, v), einops"d h l b -> d l (h b)")
+    A = softmax(batched_mul(batched_transpose(k), q) / √T(d)) .+ mask
+    x = batched_mul(v, A)
+    return rearrange(x, einops"d l (h b) -> d h l b"; h)
+end
 
-#Figure out where to thunk...
+# FIXME: below needs to properly reshape since input shape is no longer (d, h, l, b)
 
 #Will use Zygote - for testing grad correctness:
 function sdpa_norrule(xq::AbstractArray{T}, xk::AbstractArray{T}, xv::AbstractArray{T}, mask::AbstractArray{T}, head_dim::Int) where T
@@ -171,87 +179,3 @@ function ChainRulesCore.rrule(::typeof(querychunked_sdpa),
     end
     return y, sdpa_pullback
 end
-
-#=
-#Testing forward passes
-begin
-    L1 = 872 #Query
-    L2 = 267 #Key/Value
-    D = 32
-    HB = 80
-    xq, xk, xv, mask = randn(Float32, D, L1, HB), randn(Float32, D, L2, HB), randn(Float32, D, L2, HB), zeros(Float32, L2, L1);
-    f(xq, xk, xv, mask, hd) = (Jjama3.sdpa(xq, xk, xv, mask, hd));
-    fqc(xq, xk, xv, mask, hd) = (Jjama3.querychunked_sdpa(xq, xk, xv, mask, hd, q_chunk_size = 64));
-    fkc(xq, xk, xv, mask, hd) = (Jjama3.keychunked_sdpa(xq, xk, xv, mask, hd, k_chunk_size = 64));
-    
-    res = f(xq, xk, xv, mask, D);
-    qcres = fqc(xq, xk, xv, mask, D);
-    kcres = fkc(xq, xk, xv, mask, D);
-
-    @assert isapprox(res, qcres)
-    @assert isapprox(res, kcres)
-
-    @show size(res)
-    @show size(kcres)
-
-
-    #@btime f($xq, $xk, $xv, $mask, $D)
-    #@btime fqc($xq, $xk, $xv, $mask, $D)
-    #@btime fkc($xq, $xk, $xv, $mask, $D)
-end;
-=#
-
-
-
-#=
-#Testing grads
-begin
-L1 = 1000
-L2 = 1200
-D = 32
-HB = 80
-xq, xk, xv, mask = randn(Float32, D, L1, HB), randn(Float32, D, L2, HB), randn(Float32, D, L2, HB), zeros(Float32, L2, L1);
-fnr(xq, xk, xv, mask, hd) = sum(Zygote.checkpointed(Jjama3.sdpa_norrule,xq, xk, xv, mask, hd));
-f(xq, xk, xv, mask, hd) = sum(Zygote.checkpointed(Jjama3.sdpa,xq, xk, xv, mask, hd));
-flm(xq, xk, xv, mask, hd) = sum(Jjama3.querychunked_sdpa(xq, xk, xv, mask, hd, q_chunk_size = 64));
-@time res = withgradient(f, xq, xk, xv, mask, D);
-@time nrres = withgradient(fnr, xq, xk, xv, mask, D);
-@time lmres = withgradient(flm, xq, xk, xv, mask, D);
-
-@assert isapprox(res[1], nrres[1])
-@assert isapprox(res[2][1], nrres[2][1])
-@assert isapprox(res[2][2], nrres[2][2])
-@assert isapprox(res[2][3], nrres[2][3])
-@assert isapprox(res[1], lmres[1])
-@assert isapprox(res[2][1], lmres[2][1])
-@assert isapprox(res[2][2], lmres[2][2])
-@assert isapprox(res[2][3], lmres[2][3])
-
-GC.gc()
-println("normal+rrule chechpointed:")
-@time res = withgradient(f, xq, xk, xv, mask, D);
-@time res = withgradient(f, xq, xk, xv, mask, D);
-
-GC.gc()
-println("normal+Zygote chechpointed:")
-@time nrres = withgradient(fnr, xq, xk, xv, mask, D);
-@time nrres = withgradient(fnr, xq, xk, xv, mask, D);
-
-GC.gc()
-println("chunked:")
-@time lmres = withgradient(flm, xq, xk, xv, mask, D);
-@time lmres = withgradient(flm, xq, xk, xv, mask, D);
-
-
-println("btimed:")
-GC.gc()
-@btime res = withgradient(f, xq, xk, xv, mask, D);
-GC.gc()
-@btime nrres = withgradient(fnr, xq, xk, xv, mask, D);
-GC.gc()
-@btime lmres = withgradient(flm, xq, xk, xv, mask, D);
-
-true
-end
-=#
-

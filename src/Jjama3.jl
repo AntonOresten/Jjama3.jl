@@ -1,5 +1,7 @@
 module Jjama3
 
+using ConcreteStructs
+using Einops
 using Flux
 using SafeTensors
 using LinearAlgebra
@@ -23,7 +25,7 @@ export rerope_cache!
 export scrape_cache
 export append_cache!
 
-include("sdpa.jl")
+include("dot-product-attention/dpa.jl")
 
 include("model.jl")
 export forward_loss
