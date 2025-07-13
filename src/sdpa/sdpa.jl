@@ -26,47 +26,23 @@ function sdpa(q::AbstractArray{T}, k::AbstractArray{T}, v::AbstractArray{T}; mas
     return reshape(x, input_size)
 end
 
-#Will use Zygote - for testing grad correctness:
-function sdpa_norrule(xq::AbstractArray{T}, xk::AbstractArray{T}, xv::AbstractArray{T}, mask::AbstractArray{T}, head_dim::Int) where T
-    A = softmax(batched_mul(batched_transpose(xk), xq) / sqrt(T(head_dim)) .+ mask; dims=1)
-    return batched_mul(xv, A)
-end
 
-function ChainRulesCore.rrule(::typeof(sdpa),
-                              xq::AbstractArray{T}, #(D, LQ, HB)
-                              xk::AbstractArray{T}, #(D, LKV, HB)
-                              xv::AbstractArray{T}, #(D, LKV, HB)
-                              mask::AbstractArray{T}, #(LKV, LQ)
-                              head_dim::Int
-                              ) where {T}
-    α = sqrt(T(head_dim))
-    A = softmax(((batched_mul(batched_transpose(xk), xq) ./ α) .+ mask); dims=1) #(LKV, LQ, HB) "head-batch"
-    y = batched_mul(xv, A) #(D, LQ, HB)
-    function sdpa_pullback(ȳ)
-        xv̄ = batched_mul(ȳ, batched_transpose(A)) #(D, LKV, HB)
-        Ā  = batched_mul(batched_transpose(xv), ȳ) #(LKV, LQ, HB)
-        dM = (A .* (Ā .- (sum(A .* Ā, dims=1)))) ./ α #(LKV, LQ, HB)
-        xq̄ = batched_mul(xk, dM) #(D, LQ, HB)
-        xk̄ = batched_mul(xq, batched_transpose(dM)) #(D, LKV, HB)
-        return NoTangent(), xq̄, xk̄, xv̄, NoTangent(), NoTangent()
-    end
-    return y, sdpa_pullback
-end
-
-
-function keychunked_sdpa(xq::AbstractArray{T,3},
-                      xk::AbstractArray{T,3},
-                      xv::AbstractArray{T,3};
-                      mask::AbstractArray{T},
-                      head_dim::Int,
+function keychunked_sdpa(xq::AbstractArray{T,4},
+                      xk::AbstractArray{T,4},
+                      xv::AbstractArray{T,4};
+                      mask=causal_mask,
                       k_chunk_size::Int=128
                      ) where {T<:Real}
+    input_size = size(xq)
+    head_dim = size(xq, 1)
+    xq, xk, xv = rearrange.((xq, xk, xv), einops"d l ... -> d l (...)")
+    mask = mask === causal_mask ? create_causal_mask(xq) : mask
 
     k_len  = size(xk,2)
     q_len  = size(xq,2)
     nbatch = size(xq,3)
 
-    scale = one(T) / sqrt(T(head_dim))
+    scale = one(T) / √T(head_dim)
     
     partial_max  = fill!(similar(xq, 1, q_len, nbatch), -Inf)
     partial_expw = fill!(similar(xq, 1, q_len, nbatch), T(0))
@@ -117,19 +93,23 @@ function keychunked_sdpa(xq::AbstractArray{T,3},
     end
 
     y = partial_vals ./ partial_expw
-    return y
+    return reshape(y, input_size)
 end
 
-
+#=
 #Todo: use this to ignore parts of the -Inf mask triangle, since we're processing over chunks of queries.
 function querychunked_sdpa(
-    xq::AbstractArray{T,3},
-    xk::AbstractArray{T,3},
-    xv::AbstractArray{T,3},
-    mask::AbstractArray{T},
-    head_dim::Int;
+    xq::AbstractArray{T,4},
+    xk::AbstractArray{T,4},
+    xv::AbstractArray{T,4};
+    mask=causal_mask,
     q_chunk_size::Int=128
 ) where {T<:Real}
+    input_size = size(xq)
+    head_dim = size(xq, 1)
+    xq, xk, xv = rearrange.((xq, xk, xv), einops"d l ... -> d l (...)")
+    mask = mask === causal_mask ? create_causal_mask(xq) : mask
+    # FIXME: this method is trying to view the mask which fails for `mask::Bool`
     q_len   = size(xq, 2)
     kv_len  = size(xv, 2)
     nbatch  = size(xq, 3)
@@ -148,8 +128,39 @@ function querychunked_sdpa(
         batched_mul!(view(y,:,qinds,:),xv, view(Achunk,:,1:q_batch,:)) #(D, LQ, HB)
         qstart += q_batch
     end
-    return y
+    return reshape(y, input_size)
 end
+=#
+
+#=
+
+#Will use Zygote - for testing grad correctness:
+function sdpa_norrule(xq::AbstractArray{T}, xk::AbstractArray{T}, xv::AbstractArray{T}, mask::AbstractArray{T}, head_dim::Int) where T
+    A = softmax(batched_mul(batched_transpose(xk), xq) / sqrt(T(head_dim)) .+ mask; dims=1)
+    return batched_mul(xv, A)
+end
+
+function ChainRulesCore.rrule(::typeof(sdpa),
+                              xq::AbstractArray{T}, #(D, LQ, HB)
+                              xk::AbstractArray{T}, #(D, LKV, HB)
+                              xv::AbstractArray{T}, #(D, LKV, HB)
+                              mask::AbstractArray{T}, #(LKV, LQ)
+                              head_dim::Int
+                              ) where {T}
+    α = sqrt(T(head_dim))
+    A = softmax(((batched_mul(batched_transpose(xk), xq) ./ α) .+ mask); dims=1) #(LKV, LQ, HB) "head-batch"
+    y = batched_mul(xv, A) #(D, LQ, HB)
+    function sdpa_pullback(ȳ)
+        xv̄ = batched_mul(ȳ, batched_transpose(A)) #(D, LKV, HB)
+        Ā  = batched_mul(batched_transpose(xv), ȳ) #(LKV, LQ, HB)
+        dM = (A .* (Ā .- (sum(A .* Ā, dims=1)))) ./ α #(LKV, LQ, HB)
+        xq̄ = batched_mul(xk, dM) #(D, LQ, HB)
+        xk̄ = batched_mul(xq, batched_transpose(dM)) #(D, LKV, HB)
+        return NoTangent(), xq̄, xk̄, xv̄, NoTangent(), NoTangent()
+    end
+    return y, sdpa_pullback
+end
+
 
 function ChainRulesCore.rrule(::typeof(querychunked_sdpa),
                               xq::AbstractArray{T}, #(D, LQ, HB)
@@ -195,3 +206,4 @@ function ChainRulesCore.rrule(::typeof(querychunked_sdpa),
     end
     return y, sdpa_pullback
 end
+=#

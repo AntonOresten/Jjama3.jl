@@ -27,12 +27,12 @@ function generate(
 ) where T
     n, b = size(initial_tokens, 1), size(initial_tokens, 2)
     tokens = reshape(initial_tokens, n, b)
-    model(tokens[1:n-1, :]; caches, mask=causal_mask, kws...)
+    n > 1 && model(tokens[1:n-1, :]; caches, mask=causal_mask, kws...)
     for i in 1:max_new_tokens
         logits = model(tokens[end:end, 1]; caches, kws...)
         tokens = [tokens; sampler(logits[:, end])]
-        print(io, decode(tokenizer_for_printing, tokens[end:end] |> cpu, skip_special_tokens = false))
+        !isnothing(tokenizer_for_printing) && print(io, decode(tokenizer_for_printing, tokens[end:end] |> cpu, skip_special_tokens = false))
         sum(tokens[end:end]) == end_token && break
     end
-    return caches
+    return tokens
 end
