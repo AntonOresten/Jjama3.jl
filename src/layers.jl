@@ -26,7 +26,7 @@ Flux.@layer RMSNorm
 
 RMSNorm(dim::Int; eps=1f-5) = RMSNorm(ones(typeof(eps), dim), eps)
 
-function (norm::RMSNorm)(x)
+function (norm::RMSNorm)(x::AbstractArray{T}) where T
     rms = sqrt.(sum(abs2, x, dims=1) ./ size(x, 1) .+ norm.eps)
     return x .* (norm.weight ./ rms)
 end
