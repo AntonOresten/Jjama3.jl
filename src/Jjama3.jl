@@ -26,6 +26,8 @@ export append_cache!
 
 include("cache.jl")
 export kv_cache
+export no_kv_cache
+export position!
 
 include("sdpa/sdpa.jl")
 export sdpa

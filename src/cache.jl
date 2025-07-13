@@ -1,5 +1,5 @@
 no_cache(k, v) = (k, v)
-position(::typeof(no_cache)) = 0
+Base.position(::typeof(no_cache)) = 0
 
 struct KVCache{T,A<:AbstractArray{T}}
     k::A
@@ -32,7 +32,7 @@ function extend(cache::KVCache, new_len::Int)
     return KVCache(k, v, cache.pos)
 end
 
-position(cache::KVCache) = cache.pos[]
+Base.position(cache::KVCache) = cache.pos[]
 position!(cache::KVCache, new_pos::Int) = cache.pos[] = new_pos
 
 function (cache::KVCache)(k::AbstractArray, v::AbstractArray)
@@ -57,7 +57,7 @@ end
 
 extend(cache::KVCacheStack, new_len::Int) = KVCacheStack([extend(c, new_len) for c in cache.caches])
 
-position(cache::KVCacheStack) = only(unique(position.(cache.caches)))
+Base.position(cache::KVCacheStack) = only(unique(position.(cache.caches)))
 position!(cache::KVCacheStack, new_pos::Int) = only(unique(position!.(cache.caches, new_pos)))
 
 function kv_cache(model::Transformer, args...; kws...)
