@@ -1,14 +1,30 @@
-# Scaled dot product attention
-# takes d x h x l x b
-function dpa(q::AbstractArray{T}, k::AbstractArray{T}, v::AbstractArray{T}; mask) where T
-    d, h = size(q)
-    q, k, v = rearrange.((q, k, v), einops"d h l b -> d l (h b)")
-    A = softmax(batched_mul(batched_transpose(k), q) / √T(d)) .+ mask
-    x = batched_mul(v, A)
-    return rearrange(x, einops"d l (h b) -> d h l b"; h)
+include("NNop.jl")
+
+function create_causal_mask(h::AbstractArray{T}; precached_size = 0) where T<:AbstractFloat
+    @ignore_derivatives begin
+        dim, seqlen = size(h)
+        mask = similar(h, seqlen, seqlen)
+        mask .= T(-Inf)
+        mask = tril(mask, -1) #This is swapped because we're using the slightly more efficient dim setup
+        if precached_size > 0
+            pad = similar(h, precached_size, seqlen)
+            pad .= T(0.0)
+            mask = vcat(pad, mask)
+        end
+        return mask
+    end
 end
 
-# FIXME: below needs to properly reshape since input shape is no longer (d, h, l, b)
+# Scaled dot product attention
+function sdpa(q::AbstractArray{T}, k::AbstractArray{T}, v::AbstractArray{T}; mask=false) where T
+    input_size = size(q)
+    q, k, v = rearrange.((q, k, v), einops"d l ... -> d l (...)")
+    d = size(q, 1)
+    mask = mask === causal_mask ? create_causal_mask(q) : mask
+    A = softmax(batched_mul(batched_transpose(k), q) / √T(d) .+ mask, dims=1)
+    x = batched_mul(v, A)
+    return reshape(x, input_size)
+end
 
 #Will use Zygote - for testing grad correctness:
 function sdpa_norrule(xq::AbstractArray{T}, xk::AbstractArray{T}, xv::AbstractArray{T}, mask::AbstractArray{T}, head_dim::Int) where T
@@ -40,9 +56,9 @@ end
 
 function keychunked_sdpa(xq::AbstractArray{T,3},
                       xk::AbstractArray{T,3},
-                      xv::AbstractArray{T,3},
+                      xv::AbstractArray{T,3};
                       mask::AbstractArray{T},
-                      head_dim::Int;
+                      head_dim::Int,
                       k_chunk_size::Int=128
                      ) where {T<:Real}
 

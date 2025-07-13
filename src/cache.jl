@@ -1,46 +1,67 @@
-@concrete struct KVCache
-    k
-    v
-    position::Int
+no_cache(k, v) = (k, v)
+position(::typeof(no_cache)) = 0
+
+struct KVCache{T,A<:AbstractArray{T}}
+    k::A
+    v::A
+    pos::Ref{Int}
 end
 
-Base.copy(cache::KVCache) = KVCache(copy(cache.k), copy(cache.v))
-
-Flux.@layer KVCache
-
-head_dim(cache::KVCache) = size(cache.k, 1)
-seq_length(cache::KVCache) = size(cache.k, 2)
-n_kv_heads(cache::KVCache) = size(cache.k, 3)
-batch_size(cache::KVCache) = size(cache.k, 4)
-
-function KVCache(T; head_dim, seq_length=0, n_kv_heads, batch_size=1)
-    cache_k = zeros(T, head_dim, seq_length, n_kv_heads, batch_size)
-    cache_v = zeros(T, head_dim, seq_length, n_kv_heads, batch_size)
-    return KVCache(cache_k, cache_v)
+function Base.show(io::IO, ::MIME"text/plain", cache::KVCache)
+    println(io, typeof(cache), ':')
+    println(io, "  size: $(size(cache.k))")
+    println(io, "  position: $(position(cache)) / $(size(cache.k, 2))")
+    print(io, "  batches: $(size(cache.k, 4))")
 end
 
-function config!(cache::KVCache; seq_length=seq_length(cache), batch_size=batch_size(cache))
-    cache.k = similar(cache.k, head_dim(cache), seq_length, n_kv_heads(cache), batch_size) .= 0
-    cache.v = similar(cache.v, head_dim(cache), seq_length, n_kv_heads(cache), batch_size) .= 0
+function kv_cache(layer::Attention, len::Int, batch::Int=1)
+    k = similar(layer.wq.weight, layer.head_dim, len, layer.n_kv_heads, batch) .= 0
+    v = similar(layer.wv.weight, layer.head_dim, len, layer.n_kv_heads, batch) .= 0
+    return KVCache(k, v, Ref(0))
 end
 
-function extend!(cache::KVCache, new_total_length::Int)
-    old_cache = copy(cache)
-    config!(cache, seq_length=new_total_length)
-    cache.k[:, 1:seq_length(old_cache), :, :] .= old_cache.k
-    cache.v[:, 1:seq_length(old_cache), :, :] .= old_cache.v
+no_kv_cache(layer::Attention) = no_cache
+
+function extend(cache::KVCache, new_len::Int)
+    head_dim, len, kv_heads, batch = size(cache.k)
+    @assert new_len > len
+    k = similar(cache.k, head_dim, new_len, kv_heads, batch) .= 0
+    v = similar(cache.v, head_dim, new_len, kv_heads, batch) .= 0
+    k[:, 1:len, :, :] .= cache.k
+    v[:, 1:len, :, :] .= cache.v
+    return KVCache(k, v, cache.pos)
 end
 
-clear!(cache::KVCache) = config!(cache, seq_length=0)
+position(cache::KVCache) = cache.pos[]
+position!(cache::KVCache, new_pos::Int) = cache.pos[] = new_pos
 
-function update!(cache::KVCache, start_pos::Int, k::AbstractArray, v::AbstractArray)
-    if iszero(seq_length(cache))
-        return k, v
-    else
-        seqlen = size(k, 2)
-        cache.k[:, start_pos+1:start_pos+seqlen, :, :] .= k
-        cache.v[:, start_pos+1:start_pos+seqlen, :, :] .= v
-        return cache.k[:, 1:start_pos+seqlen, :, :],
-            cache.v[:, 1:start_pos+seqlen, :, :]
-    end
+function (cache::KVCache)(k::AbstractArray, v::AbstractArray)
+    cache.k[:, position(cache) .+ axes(k, 2), :, :] .= k
+    cache.v[:, position(cache) .+ axes(v, 2), :, :] .= v
+    position!(cache, position(cache) + size(k, 2))
+    return @views cache.k[:, 1:position(cache), :, :], cache.v[:, 1:position(cache), :, :]
 end
+
+
+struct KVCacheStack{C}
+    caches::Vector{C}
+end
+
+Base.iterate(cache::KVCacheStack, state...) = iterate(cache.caches, state...)
+
+function Base.show(io::IO, ::MIME"text/plain", cache::KVCacheStack)
+    println(io, typeof(cache), ':')
+    println(io, "  caches: $(length(cache.caches))")
+    println(io, "  position: $(position(cache))")
+end
+
+extend(cache::KVCacheStack, new_len::Int) = KVCacheStack([extend(c, new_len) for c in cache.caches])
+
+position(cache::KVCacheStack) = only(unique(position.(cache.caches)))
+position!(cache::KVCacheStack, new_pos::Int) = only(unique(position!.(cache.caches, new_pos)))
+
+function kv_cache(model::Transformer, args...; kws...)
+    return KVCacheStack([kv_cache(layer.attention, args...; kws...) for layer in model.layers])
+end
+
+no_kv_cache(model::Transformer) = KVCacheStack([no_kv_cache(layer.attention) for layer in model.layers])
