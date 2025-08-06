@@ -31,4 +31,4 @@ end
 
 # compat
 forward_inference(model, args...) = model(args...)
-forward_loss(model::Transformer, inputs::AbstractArray, targets::AbstractArray; clear_cache = true, loss_mask = nothing) = loss(model(inputs, clear_cache = clear_cache), targets, loss_mask = loss_mask)
+forward_loss(model::Transformer, inputs::AbstractArray, targets::AbstractArray; loss_mask = nothing, kws...) = loss(model(inputs; kws...), targets, loss_mask = loss_mask)

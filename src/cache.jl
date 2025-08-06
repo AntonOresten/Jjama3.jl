@@ -84,7 +84,7 @@ end
 
 
 struct KVCacheStack{C}
-    caches::Vector{C}
+    caches::Tuple{Vararg{C}}
 end
 
 Base.iterate(cache::KVCacheStack, state...) = iterate(cache.caches, state...)
@@ -95,16 +95,36 @@ function Base.show(io::IO, ::MIME"text/plain", cache::KVCacheStack)
     println(io, "  position: $(position(cache))")
 end
 
-extend(cache::KVCacheStack, new_len::Int) = KVCacheStack([extend(c, new_len) for c in cache.caches])
+extend(cache::KVCacheStack, new_len::Int) = KVCacheStack(tuple((extend(c, new_len) for c in cache.caches)...))
 
-Base.position(cache::KVCacheStack) = only(unique(position.(cache.caches)))
-position!(cache::KVCacheStack, new_pos::Int) = only(unique(position!.(cache.caches, new_pos)))
-
-function kv_cache(model::Transformer, args...; kws...)
-    return KVCacheStack([kv_cache(layer.attention, args...; kws...) for layer in model.layers])
+# Helper function to assert all caches have the expected position (Zygote-friendly)
+function _assert_all_positions_equal(caches, expected_pos::Int, error_msg::String)
+    for c in caches
+        pos_c = position(c)
+        pos_c == expected_pos || throw(AssertionError("$error_msg: expected $expected_pos, got $pos_c"))
+    end
 end
 
-no_kv_cache(model::Transformer) = KVCacheStack([no_kv_cache(layer.attention) for layer in model.layers])
+function Base.position(cache::KVCacheStack)
+    first_pos = position(first(cache.caches))
+    _assert_all_positions_equal(cache.caches, first_pos, "All cache positions must be the same")
+    return first_pos
+end
+
+function position!(cache::KVCacheStack, new_pos::Int)
+    # Set position for all caches
+    for c in cache.caches
+        position!(c, new_pos)
+    end
+    _assert_all_positions_equal(cache.caches, new_pos, "Failed to set cache position")
+    return new_pos
+end
+
+function kv_cache(model::Transformer, args...; kws...)
+    return KVCacheStack(tuple((kv_cache(layer.attention, args...; kws...) for layer in model.layers)...))
+end
+
+no_kv_cache(model::Transformer) = KVCacheStack(tuple((no_kv_cache(layer.attention) for layer in model.layers)...))
 
 function unrope!(caches::KVCacheStack, rope::RoPE)
     for cache in caches
