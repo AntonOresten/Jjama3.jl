@@ -3,6 +3,12 @@ function nexttoken!(tokens, pos, model, sampler, logits, tokenizer_for_printing)
     !isnothing(tokenizer_for_printing) && print(decode(tokenizer_for_printing, tokens[pos+1:pos+1] |> cpu, skip_special_tokens = false))
 end
 
+function handle_token(tokenizer, token, end_token)
+    token = Array(token)
+    !isnothing(tokenizer) && print(decode(tokenizer, token, skip_special_tokens = false))
+    return only(token) == end_token
+end
+
 """
     generate(model, initial_tokens; max_new_tokens=100, sampler=top_pk_sampler(p=0.5f0, k=5), tokenizer_for_printing=tkn, end_token=128010)
 
@@ -15,24 +21,23 @@ generate(model, initial_tokens; max_new_tokens=100, sampler=top_pk_sampler(p=0.5
 ```
 """
 function generate(
-    model::Transformer{T}, 
+    model::Transformer{T},
     initial_tokens::AbstractArray{<:Integer};
-    io=stdout,
     max_new_tokens=100,
-    sampler::Function=argmax_sampler, #top_pk_sampler(p=0.5f0, k=5),
+    sampler = x -> logitsample(x, dims=1),
     tokenizer_for_printing = nothing,
     end_token = 128010,
     caches=kv_cache(model, 1024, 1),
     kws...
 ) where T
-    n, b = size(initial_tokens, 1), size(initial_tokens, 2)
-    tokens = reshape(initial_tokens, n, b)
-    n > 1 && model(tokens[1:n-1, :]; caches, mask=causal_mask, kws...)
+    n = size(initial_tokens, 1)
+    tokens = initial_tokens
+    n > 1 && model(tokens[1:n-1, :]; causal=true, caches, kws...)
     for i in 1:max_new_tokens
-        logits = model(tokens[end:end, 1]; caches, kws...)
-        tokens = [tokens; sampler(logits[:, end])]
-        !isnothing(tokenizer_for_printing) && print(io, decode(tokenizer_for_printing, tokens[end:end] |> cpu, skip_special_tokens = false))
-        sum(tokens[end:end]) == end_token && break
+        logits = model(tokens[end:end, :]; caches, kws...)
+        sampled_token = sampler(logits[:, end])
+        tokens = [tokens; sampled_token]
+        handle_token(tokenizer_for_printing, sampled_token, end_token) && break
     end
     return tokens
 end

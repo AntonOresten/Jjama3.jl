@@ -1,39 +1,19 @@
 module Jjama3
 
+using ChainRulesCore
 using ConcreteStructs
 using Einops
 using Flux
+using GPUArrays
 using SafeTensors
 using LinearAlgebra
 using NNlib
+using Onion
 using LogitSamplers
 using LowRankLayers
-using ChainRulesCore
-
-const causal_mask = Val(:causal_mask)
-
-include("layers.jl")
-export FeedForward
-export RMSNorm
-export RoPE
-export Attention
-export TransformerBlock
-export Transformer
-export unrope
-export rerope_cache!
-export scrape_cache
-export append_cache!
-
-include("cache.jl")
-export kv_cache
-export no_kv_cache
-export position!
-
-include("sdpa/sdpa.jl")
-export sdpa
-export flash_attention
 
 include("model.jl")
+export Transformer
 export forward_loss
 export forward_inference
 export loss
