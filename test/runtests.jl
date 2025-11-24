@@ -1,9 +1,9 @@
-using Jjama3
+using Jjama
 using Test
-using JSON3
+using JSON
 using Downloads
 
-@testset "Jjama3.jl" begin
+@testset "Jjama.jl" begin
 
     @testset "Amino Acid Model" begin
         url_branch = "https://raw.githubusercontent.com/MurrellGroup/Jjama3.jl/aminoacid-model/"
